@@ -18,11 +18,13 @@
 #include <cmath>
 #include <cstring>
 #include <iostream>
-#include <shared_mutex>
+#include <mutex>
 #include <thread>
 #include <tuple>
 #include <unordered_map>
 #include <vector>
+#include <utility>
+#include <tuple>
 
 #include "../util/hash.h"
 #include "../util/pair.h"
@@ -63,8 +65,8 @@ const constexpr size_t kNumBucket =
 constexpr size_t stashBucket =
     2; /* the number of stash buckets in one segment*/
 constexpr int allocMask = (1 << kNumPairPerBucket) - 1;
-constexpr size_t bucketMask = ((1 << (int)log2(kNumBucket)) - 1);
-constexpr size_t stashMask = (1 << (int)log2(stashBucket)) - 1;
+constexpr size_t bucketMask = 63;
+constexpr size_t stashMask = 1;
 constexpr uint8_t stashHighMask = ~((uint8_t)stashMask);
 
 #define BUCKET_INDEX(hash) ((hash >> kFingerBits) & bucketMask)
@@ -76,6 +78,28 @@ constexpr uint8_t stashHighMask = ~((uint8_t)stashMask);
 inline bool var_compare(char *str1, char *str2, int len1, int len2) {
   if (len1 != len2) return false;
   return !memcmp(str1, str2, len1);
+}
+
+template <typename T, bool is_pointer>
+struct KeyHash;
+
+template <typename T>
+struct KeyHash<T, true> {
+  static uint64_t Hash(T key) {
+    return h(key->key, key->length);
+  }
+};
+
+template <typename T>
+struct KeyHash<T, false> {
+  static uint64_t Hash(T key) {
+    return h(&key, sizeof(key));
+  }
+};
+
+template <typename T>
+uint64_t KeyHashProxy (T key) {
+  return KeyHash<T, std::is_pointer<T>::value>::Hash(key);
 }
 
 template <class T>
@@ -230,6 +254,61 @@ struct Bucket {
     return mask;
   }
 
+  template <bool is_pointer, typename = void>
+  struct CheckAndGetImpl;
+
+  template <typename U>
+  struct CheckAndGetImpl<true, U> {
+    static Value_t Process(int mask, T key, Bucket *bucket) {
+      /* variable-length key*/
+      string_key *_key = reinterpret_cast<string_key *>(key);
+      for (int i = 0; i < 14; i += 1) {
+        if (CHECK_BIT(mask, i) &&
+            (var_compare((reinterpret_cast<string_key *>(bucket->_[i].key))->key,
+                         _key->key,
+                         (reinterpret_cast<string_key *>(bucket->_[i].key))->length,
+                         _key->length))) {
+          return bucket->_[i].value;
+        }
+      }
+      return NONE;
+    }
+  };
+
+  template <typename U>
+  struct CheckAndGetImpl<false, U> {
+    static Value_t Process(int mask, T key, Bucket *bucket) {
+      /*fixed-length key*/
+      /*loop unrolling*/
+      for (int i = 0; i < 12; i += 4) {
+        if (CHECK_BIT(mask, i) && (bucket->_[i].key == key)) {
+          return bucket->_[i].value;
+        }
+
+        if (CHECK_BIT(mask, i + 1) && (bucket->_[i + 1].key == key)) {
+          return bucket->_[i + 1].value;
+        }
+
+        if (CHECK_BIT(mask, i + 2) && (bucket->_[i + 2].key == key)) {
+          return bucket->_[i + 2].value;
+        }
+
+        if (CHECK_BIT(mask, i + 3) && (bucket->_[i + 3].key == key)) {
+          return bucket->_[i + 3].value;
+        }
+      }
+
+      if (CHECK_BIT(mask, 12) && (bucket->_[12].key == key)) {
+        return bucket->_[12].value;
+      }
+
+      if (CHECK_BIT(mask, 13) && (bucket->_[13].key == key)) {
+        return bucket->_[13].value;
+      }
+      return NONE;
+    }
+  };
+
   Value_t check_and_get(uint8_t meta_hash, T key, bool probe) {
     int mask = 0;
     SSE_CMP8(finger_array, meta_hash);
@@ -243,48 +322,7 @@ struct Bucket {
       return NONE;
     }
 
-    if constexpr (std::is_pointer_v<T>) {
-      /* variable-length key*/
-      string_key *_key = reinterpret_cast<string_key *>(key);
-      for (int i = 0; i < 14; i += 1) {
-        if (CHECK_BIT(mask, i) &&
-            (var_compare((reinterpret_cast<string_key *>(_[i].key))->key,
-                         _key->key,
-                         (reinterpret_cast<string_key *>(_[i].key))->length,
-                         _key->length))) {
-          return _[i].value;
-        }
-      }
-    } else {
-      /*fixed-length key*/
-      /*loop unrolling*/
-      for (int i = 0; i < 12; i += 4) {
-        if (CHECK_BIT(mask, i) && (_[i].key == key)) {
-          return _[i].value;
-        }
-
-        if (CHECK_BIT(mask, i + 1) && (_[i + 1].key == key)) {
-          return _[i + 1].value;
-        }
-
-        if (CHECK_BIT(mask, i + 2) && (_[i + 2].key == key)) {
-          return _[i + 2].value;
-        }
-
-        if (CHECK_BIT(mask, i + 3) && (_[i + 3].key == key)) {
-          return _[i + 3].value;
-        }
-      }
-
-      if (CHECK_BIT(mask, 12) && (_[12].key == key)) {
-        return _[12].value;
-      }
-
-      if (CHECK_BIT(mask, 13) && (_[13].key == key)) {
-        return _[13].value;
-      }
-    }
-    return NONE;
+    return CheckAndGetImpl<std::is_pointer<T>::value>::Process(mask, key, this);
   }
 
   inline void set_hash(int index, uint8_t meta_hash, bool probe) {
@@ -373,6 +411,115 @@ struct Bucket {
     return 0;
   }
 
+  template <bool is_pointer, typename = void>
+  struct DeleteImpl;
+
+  template <typename U>
+  struct DeleteImpl<true, U> {
+    static int Process(int mask, T key, Bucket *bucket) {
+      string_key *_key = reinterpret_cast<string_key *>(key);
+      /*loop unrolling*/
+      if (mask != 0) {
+        for (int i = 0; i < 12; i += 4) {
+          if (CHECK_BIT(mask, i) &&
+              (var_compare((reinterpret_cast<string_key *>(bucket->_[i].key))->key,
+                           _key->key,
+                           (reinterpret_cast<string_key *>(bucket->_[i].key))->length,
+                           _key->length))) {
+            bucket->unset_hash(i, false);
+            return 0;
+          }
+
+          if (CHECK_BIT(mask, i + 1) &&
+              (var_compare(
+                  reinterpret_cast<string_key *>(bucket->_[i + 1].key)->key, _key->key,
+                  (reinterpret_cast<string_key *>(bucket->_[i + 1].key))->length,
+                  _key->length))) {
+            bucket->unset_hash(i + 1, false);
+            return 0;
+          }
+
+          if (CHECK_BIT(mask, i + 2) &&
+              (var_compare(
+                  reinterpret_cast<string_key *>(bucket->_[i + 2].key)->key, _key->key,
+                  (reinterpret_cast<string_key *>(bucket->_[i + 2].key))->length,
+                  _key->length))) {
+            bucket->unset_hash(i + 2, false);
+            return 0;
+          }
+
+          if (CHECK_BIT(mask, i + 3) &&
+              (var_compare(
+                  reinterpret_cast<string_key *>(bucket->_[i + 3].key)->key, _key->key,
+                  (reinterpret_cast<string_key *>(bucket->_[i + 3].key))->length,
+                  _key->length))) {
+            bucket->unset_hash(i + 3, false);
+            return 0;
+          }
+        }
+
+        if (CHECK_BIT(mask, 12) &&
+            (var_compare(reinterpret_cast<string_key *>(bucket->_[12].key)->key,
+                         _key->key,
+                         (reinterpret_cast<string_key *>(bucket->_[12].key))->length,
+                         _key->length))) {
+          bucket->unset_hash(12, false);
+          return 0;
+        }
+
+        if (CHECK_BIT(mask, 13) &&
+            (var_compare(reinterpret_cast<string_key *>(bucket->_[13].key)->key,
+                         _key->key,
+                         (reinterpret_cast<string_key *>(bucket->_[13].key))->length,
+                         _key->length))) {
+          bucket->unset_hash(13, false);
+          return 0;
+        }
+      }
+      return -1;
+    }
+  };
+
+  template <typename U>
+  struct DeleteImpl<false, U> {
+    static int Process(int mask, T key, Bucket *bucket) {
+      if (mask != 0) {
+        for (int i = 0; i < 12; i += 4) {
+          if (CHECK_BIT(mask, i) && (bucket->_[i].key == key)) {
+            bucket->unset_hash(i, false);
+            return 0;
+          }
+
+          if (CHECK_BIT(mask, i + 1) && (bucket->_[i + 1].key == key)) {
+            bucket->unset_hash(i + 1, false);
+            return 0;
+          }
+
+          if (CHECK_BIT(mask, i + 2) && (bucket->_[i + 2].key == key)) {
+            bucket->unset_hash(i + 2, false);
+            return 0;
+          }
+
+          if (CHECK_BIT(mask, i + 3) && (bucket->_[i + 3].key == key)) {
+            bucket->unset_hash(i + 3, false);
+            return 0;
+          }
+        }
+
+        if (CHECK_BIT(mask, 12) && (bucket->_[12].key == key)) {
+          bucket->unset_hash(12, false);
+          return 0;
+        }
+
+        if (CHECK_BIT(mask, 13) && (bucket->_[13].key == key)) {
+          bucket->unset_hash(13, false);
+          return 0;
+        }
+      }
+      return -1;
+    }
+  };
+
   /*if delete success, then return 0, else return -1*/
   int Delete(T key, uint8_t meta_hash, bool probe) {
     /*do the simd and check the key, then do the delete operation*/
@@ -384,104 +531,7 @@ struct Bucket {
       mask = mask & GET_BITMAP(bitmap) & GET_MEMBER(bitmap);
     }
 
-    /*loop unrolling*/
-    if constexpr (std::is_pointer_v<T>) {
-      string_key *_key = reinterpret_cast<string_key *>(key);
-      /*loop unrolling*/
-      if (mask != 0) {
-        for (int i = 0; i < 12; i += 4) {
-          if (CHECK_BIT(mask, i) &&
-              (var_compare((reinterpret_cast<string_key *>(_[i].key))->key,
-                           _key->key,
-                           (reinterpret_cast<string_key *>(_[i].key))->length,
-                           _key->length))) {
-            unset_hash(i, false);
-            return 0;
-          }
-
-          if (CHECK_BIT(mask, i + 1) &&
-              (var_compare(
-                  reinterpret_cast<string_key *>(_[i + 1].key)->key, _key->key,
-                  (reinterpret_cast<string_key *>(_[i + 1].key))->length,
-                  _key->length))) {
-            unset_hash(i + 1, false);
-            return 0;
-          }
-
-          if (CHECK_BIT(mask, i + 2) &&
-              (var_compare(
-                  reinterpret_cast<string_key *>(_[i + 2].key)->key, _key->key,
-                  (reinterpret_cast<string_key *>(_[i + 2].key))->length,
-                  _key->length))) {
-            unset_hash(i + 2, false);
-            return 0;
-          }
-
-          if (CHECK_BIT(mask, i + 3) &&
-              (var_compare(
-                  reinterpret_cast<string_key *>(_[i + 3].key)->key, _key->key,
-                  (reinterpret_cast<string_key *>(_[i + 3].key))->length,
-                  _key->length))) {
-            unset_hash(i + 3, false);
-            return 0;
-          }
-        }
-
-        if (CHECK_BIT(mask, 12) &&
-            (var_compare(reinterpret_cast<string_key *>(_[12].key)->key,
-                         _key->key,
-                         (reinterpret_cast<string_key *>(_[12].key))->length,
-                         _key->length))) {
-          unset_hash(12, false);
-          return 0;
-        }
-
-        if (CHECK_BIT(mask, 13) &&
-            (var_compare(reinterpret_cast<string_key *>(_[13].key)->key,
-                         _key->key,
-                         (reinterpret_cast<string_key *>(_[13].key))->length,
-                         _key->length))) {
-          unset_hash(13, false);
-          return 0;
-        }
-      }
-
-    } else {
-      if (mask != 0) {
-        for (int i = 0; i < 12; i += 4) {
-          if (CHECK_BIT(mask, i) && (_[i].key == key)) {
-            unset_hash(i, false);
-            return 0;
-          }
-
-          if (CHECK_BIT(mask, i + 1) && (_[i + 1].key == key)) {
-            unset_hash(i + 1, false);
-            return 0;
-          }
-
-          if (CHECK_BIT(mask, i + 2) && (_[i + 2].key == key)) {
-            unset_hash(i + 2, false);
-            return 0;
-          }
-
-          if (CHECK_BIT(mask, i + 3) && (_[i + 3].key == key)) {
-            unset_hash(i + 3, false);
-            return 0;
-          }
-        }
-
-        if (CHECK_BIT(mask, 12) && (_[12].key == key)) {
-          unset_hash(12, false);
-          return 0;
-        }
-
-        if (CHECK_BIT(mask, 13) && (_[13].key == key)) {
-          unset_hash(13, false);
-          return 0;
-        }
-      }
-    }
-    return -1;
+    return DeleteImpl<std::is_pointer<T>::value>::Process(mask, key, this);
   }
 
   int Insert_with_noflush(T key, Value_t value, uint8_t meta_hash, bool probe) {
@@ -588,7 +638,7 @@ struct Directory {
                       sizeof(Directory<T>) + sizeof(uint64_t) * cap);
       return 0;
     };
-    std::tuple callback_args = {capacity, version};
+    std::tuple<size_t, size_t> callback_args{capacity, version};
     Allocator::Allocate(dir, kCacheLineSize,
                         sizeof(Directory<T>) + sizeof(table_p) * capacity,
                         callback, reinterpret_cast<void *>(&callback_args));
@@ -609,7 +659,7 @@ struct TlsTablePool {
 
   static void AllocateMore() {
     auto callback = [](PMEMobjpool *pool, void *ptr, void *arg) { return 0; };
-    std::pair callback_para(0, nullptr);
+    std::pair<size_t, void*> callback_para(0, nullptr);
     Allocator::Allocate(&p_all_tables, kCacheLineSize,
                         sizeof(Table<T>) * kAllTables, callback,
                         reinterpret_cast<void *>(&callback_para));
@@ -682,7 +732,7 @@ struct Table {
       pmemobj_persist(pool, table_ptr, sizeof(Table<T>));
       return 0;
     };
-    std::pair callback_para(depth, pp);
+    std::pair<size_t, PMEMoid> callback_para(depth, pp);
     Allocator::Allocate(tbl, kCacheLineSize, sizeof(Table<T>), callback,
                         reinterpret_cast<void *>(&callback_para));
 #endif
@@ -840,12 +890,14 @@ struct Table {
       auto mask = GET_BITMAP(curr_bucket->bitmap);
       for (int j = 0; j < kNumPairPerBucket; ++j) {
         if (CHECK_BIT(mask, j)) {
-          if constexpr (std::is_pointer_v<T>) {
-            auto curr_key = curr_bucket->_[j].key;
-            key_hash = h(curr_key->key, curr_key->length);
-          } else {
-            key_hash = h(&(curr_bucket->_[j].key), sizeof(Key_t));
-          }
+          auto curr_key = curr_bucket->_[j].key;
+          key_hash = KeyHashProxy<T>(curr_key);
+//          if constexpr (std::is_pointer<T>::value) {
+//            auto curr_key = curr_bucket->_[j].key;
+//            key_hash = h(curr_key->key, curr_key->length);
+//          } else {
+//            key_hash = h(&(curr_bucket->_[j].key), sizeof(Key_t));
+//          }
           /*compute the initial bucket*/
           auto bucket_ix = BUCKET_INDEX(key_hash);
           auto meta_hash = ((uint8_t)(key_hash & kMask));  // the last 8 bits
@@ -1218,12 +1270,14 @@ void Table<T>::HelpSplit(Table<T> *next_table) {
     uint32_t invalid_mask = 0;
     for (int j = 0; j < kNumPairPerBucket; ++j) {
       if (CHECK_BIT(mask, j)) {
-        if constexpr (std::is_pointer_v<T>) {
-          auto curr_key = curr_bucket->_[j].key;
-          key_hash = h(curr_key->key, curr_key->length);
-        } else {
-          key_hash = h(&(curr_bucket->_[j].key), sizeof(Key_t));
-        }
+        auto curr_key = curr_bucket->_[j].key;
+        key_hash = KeyHashProxy(curr_key);
+//        if constexpr (std::is_pointer<T>::value) {
+//          auto curr_key = curr_bucket->_[j].key;
+//          key_hash = h(curr_key->key, curr_key->length);
+//        } else {
+//          key_hash = h(&(curr_bucket->_[j].key), sizeof(Key_t));
+//        }
 
         if ((key_hash >> (64 - local_depth - 1)) == new_pattern) {
           invalid_mask = invalid_mask | (1 << j);
@@ -1245,12 +1299,14 @@ void Table<T>::HelpSplit(Table<T> *next_table) {
     uint32_t invalid_mask = 0;
     for (int j = 0; j < kNumPairPerBucket; ++j) {
       if (CHECK_BIT(mask, j)) {
-        if constexpr (std::is_pointer_v<T>) {
-          auto curr_key = curr_bucket->_[j].key;
-          key_hash = h(curr_key->key, curr_key->length);
-        } else {
-          key_hash = h(&(curr_bucket->_[j].key), sizeof(Key_t));
-        }
+        auto curr_key = curr_bucket->_[j].key;
+        key_hash = KeyHashProxy(curr_key);
+//        if constexpr (std::is_pointer<T>::value) {
+//          auto curr_key = curr_bucket->_[j].key;
+//          key_hash = h(curr_key->key, curr_key->length);
+//        } else {
+//          key_hash = h(&(curr_bucket->_[j].key), sizeof(Key_t));
+//        }
         if ((key_hash >> (64 - local_depth - 1)) == new_pattern) {
           invalid_mask = invalid_mask | (1 << j);
           next_table->Insert4splitWithCheck(curr_bucket->_[j].key,
@@ -1316,12 +1372,14 @@ Table<T> *Table<T>::Split(size_t _key_hash) {
     uint32_t invalid_mask = 0;
     for (int j = 0; j < kNumPairPerBucket; ++j) {
       if (CHECK_BIT(mask, j)) {
-        if constexpr (std::is_pointer_v<T>) {
-          auto curr_key = curr_bucket->_[j].key;
-          key_hash = h(curr_key->key, curr_key->length);
-        } else {
-          key_hash = h(&(curr_bucket->_[j].key), sizeof(Key_t));
-        }
+        auto curr_key = curr_bucket->_[j].key;
+        key_hash = KeyHashProxy(curr_key);
+//        if constexpr (std::is_pointer<T>::value) {
+//          auto curr_key = curr_bucket->_[j].key;
+//          key_hash = h(curr_key->key, curr_key->length);
+//        } else {
+//          key_hash = h(&(curr_bucket->_[j].key), sizeof(Key_t));
+//        }
 
         if ((key_hash >> (64 - local_depth - 1)) == new_pattern) {
           invalid_mask = invalid_mask | (1 << j);
@@ -1345,12 +1403,14 @@ Table<T> *Table<T>::Split(size_t _key_hash) {
     uint32_t invalid_mask = 0;
     for (int j = 0; j < kNumPairPerBucket; ++j) {
       if (CHECK_BIT(mask, j)) {
-        if constexpr (std::is_pointer_v<T>) {
-          auto curr_key = curr_bucket->_[j].key;
-          key_hash = h(curr_key->key, curr_key->length);
-        } else {
-          key_hash = h(&(curr_bucket->_[j].key), sizeof(Key_t));
-        }
+        auto curr_key = curr_bucket->_[j].key;
+        key_hash = KeyHashProxy(curr_key);
+//        if constexpr (std::is_pointer<T>::value) {
+//          auto curr_key = curr_bucket->_[j].key;
+//          key_hash = h(curr_key->key, curr_key->length);
+//        } else {
+//          key_hash = h(&(curr_bucket->_[j].key), sizeof(Key_t));
+//        }
         if ((key_hash >> (64 - local_depth - 1)) == new_pattern) {
           invalid_mask = invalid_mask | (1 << j);
           next_table->Insert4split(
@@ -1402,12 +1462,14 @@ void Table<T>::Merge(Table<T> *neighbor, bool unique_check_flag) {
       auto mask = GET_BITMAP(curr_bucket->bitmap);
       for (int j = 0; j < kNumPairPerBucket; ++j) {
         if (CHECK_BIT(mask, j)) {
-          if constexpr (std::is_pointer_v<T>) {
-            auto curr_key = curr_bucket->_[j].key;
-            key_hash = h(curr_key->key, curr_key->length);
-          } else {
-            key_hash = h(&(curr_bucket->_[j].key), sizeof(Key_t));
-          }
+          auto curr_key = curr_bucket->_[j].key;
+          key_hash = KeyHashProxy(curr_key);
+//          if constexpr (std::is_pointer<T>::value) {
+//            auto curr_key = curr_bucket->_[j].key;
+//            key_hash = h(curr_key->key, curr_key->length);
+//          } else {
+//            key_hash = h(&(curr_bucket->_[j].key), sizeof(Key_t));
+//          }
 
           Insert4merge(curr_bucket->_[j].key, curr_bucket->_[j].value, key_hash,
                        curr_bucket->finger_array[j],
@@ -1422,12 +1484,14 @@ void Table<T>::Merge(Table<T> *neighbor, bool unique_check_flag) {
       auto mask = GET_BITMAP(curr_bucket->bitmap);
       for (int j = 0; j < kNumPairPerBucket; ++j) {
         if (CHECK_BIT(mask, j)) {
-          if constexpr (std::is_pointer_v<T>) {
-            auto curr_key = curr_bucket->_[j].key;
-            key_hash = h(curr_key->key, curr_key->length);
-          } else {
-            key_hash = h(&(curr_bucket->_[j].key), sizeof(Key_t));
-          }
+          auto curr_key = curr_bucket->_[j].key;
+          key_hash = KeyHashProxy(curr_key);
+//          if constexpr (std::is_pointer<T>::value) {
+//            auto curr_key = curr_bucket->_[j].key;
+//            key_hash = h(curr_key->key, curr_key->length);
+//          } else {
+//            key_hash = h(&(curr_bucket->_[j].key), sizeof(Key_t));
+//          }
           Insert4merge(curr_bucket->_[j].key, curr_bucket->_[j].value, key_hash,
                        curr_bucket->finger_array[j]); /*this shceme may destory
                                                          the balanced segment*/
@@ -1442,12 +1506,14 @@ void Table<T>::Merge(Table<T> *neighbor, bool unique_check_flag) {
       auto mask = GET_BITMAP(curr_bucket->bitmap);
       for (int j = 0; j < kNumPairPerBucket; ++j) {
         if (CHECK_BIT(mask, j)) {
-          if constexpr (std::is_pointer_v<T>) {
-            auto curr_key = curr_bucket->_[j].key;
-            key_hash = h(curr_key->key, curr_key->length);
-          } else {
-            key_hash = h(&(curr_bucket->_[j].key), sizeof(Key_t));
-          }
+          auto curr_key = curr_bucket->_[j].key;
+          key_hash = KeyHashProxy(curr_key);
+//          if constexpr (std::is_pointer<T>::value) {
+//            auto curr_key = curr_bucket->_[j].key;
+//            key_hash = h(curr_key->key, curr_key->length);
+//          } else {
+//            key_hash = h(&(curr_bucket->_[j].key), sizeof(Key_t));
+//          }
 
           Insert4merge(curr_bucket->_[j].key, curr_bucket->_[j].value, key_hash,
                        curr_bucket->finger_array[j]); /*this shceme may destory
@@ -1462,12 +1528,14 @@ void Table<T>::Merge(Table<T> *neighbor, bool unique_check_flag) {
       auto mask = GET_BITMAP(curr_bucket->bitmap);
       for (int j = 0; j < kNumPairPerBucket; ++j) {
         if (CHECK_BIT(mask, j)) {
-          if constexpr (std::is_pointer_v<T>) {
-            auto curr_key = curr_bucket->_[j].key;
-            key_hash = h(curr_key->key, curr_key->length);
-          } else {
-            key_hash = h(&(curr_bucket->_[j].key), sizeof(Key_t));
-          }
+          auto curr_key = curr_bucket->_[j].key;
+          key_hash = KeyHashProxy(curr_key);
+//          if constexpr (std::is_pointer<T>::value) {
+//            auto curr_key = curr_bucket->_[j].key;
+//            key_hash = h(curr_key->key, curr_key->length);
+//          } else {
+//            key_hash = h(&(curr_bucket->_[j].key), sizeof(Key_t));
+//          }
           Insert4merge(curr_bucket->_[j].key, curr_bucket->_[j].value, key_hash,
                        curr_bucket->finger_array[j]); /*this shceme may destory
                                                          the balanced segment*/
@@ -1903,12 +1971,13 @@ int Finger_EH<T>::Insert(T key, Value_t value, bool is_in_epoch) {
 
 template <class T>
 int Finger_EH<T>::Insert(T key, Value_t value) {
-  uint64_t key_hash;
-  if constexpr (std::is_pointer_v<T>) {
-    key_hash = h(key->key, key->length);
-  } else {
-    key_hash = h(&key, sizeof(key));
-  }
+   uint64_t key_hash = KeyHashProxy<T>(key);
+//  uint64_t key_hash;
+//  if constexpr (std::is_pointer<T>::value) {
+//    key_hash = h(key->key, key->length);
+//  } else {
+//    key_hash = h(&key, sizeof(key));
+//  }
 
   auto meta_hash = ((uint8_t)(key_hash & kMask));  // the last 8 bits
 RETRY:
@@ -2003,12 +2072,12 @@ Value_t Finger_EH<T>::Get(T key, bool is_in_epoch) {
     auto epoch_guard = Allocator::AquireEpochGuard();
     return Get(key);
   }
-  uint64_t key_hash;
-  if constexpr (std::is_pointer_v<T>) {
-    key_hash = h(key->key, key->length);
-  } else {
-    key_hash = h(&key, sizeof(key));
-  }
+  uint64_t key_hash = KeyHashProxy<T>(key);
+//  if constexpr (std::is_pointer<T>::value) {
+//    key_hash = h(key->key, key->length);
+//  } else {
+//    key_hash = h(&key, sizeof(key));
+//  }
   auto meta_hash = ((uint8_t)(key_hash & kMask));  // the last 8 bits
 RETRY:
   auto old_sa = dir;
@@ -2132,12 +2201,12 @@ FINAL:
 
 template <class T>
 Value_t Finger_EH<T>::Get(T key) {
-  uint64_t key_hash;
-  if constexpr (std::is_pointer_v<T>) {
-    key_hash = h(key->key, key->length);
-  } else {
-    key_hash = h(&key, sizeof(key));
-  }
+  uint64_t key_hash = KeyHashProxy(key);
+//  if constexpr (std::is_pointer<T>::value) {
+//    key_hash = h(key->key, key->length);
+//  } else {
+//    key_hash = h(&key, sizeof(key));
+//  }
   auto meta_hash = ((uint8_t)(key_hash & kMask));  // the last 8 bits
 RETRY:
   auto old_sa = dir;
@@ -2380,12 +2449,12 @@ bool Finger_EH<T>::Delete(T key, bool is_in_epoch) {
 template <class T>
 bool Finger_EH<T>::Delete(T key) {
   /*Basic delete operation and merge operation*/
-  uint64_t key_hash;
-  if constexpr (std::is_pointer_v<T>) {
-    key_hash = h(key->key, key->length);
-  } else {
-    key_hash = h(&key, sizeof(key));
-  }
+  uint64_t key_hash = KeyHashProxy(key);
+//  if constexpr (std::is_pointer<T>::value) {
+//    key_hash = h(key->key, key->length);
+//  } else {
+//    key_hash = h(&key, sizeof(key));
+//  }
   auto meta_hash = ((uint8_t)(key_hash & kMask));  // the last 8 bits
 RETRY:
   auto old_sa = dir;
@@ -2533,13 +2602,13 @@ RETRY:
 
 template <class T>
 int Finger_EH<T>::FindAnyway(T key) {
-  uint64_t key_hash;
-  if constexpr (std::is_pointer_v<T>) {
-    // key_hash = h(key, (reinterpret_cast<string_key *>(key))->length);
-    key_hash = h(key->key, key->length);
-  } else {
-    key_hash = h(&key, sizeof(key));
-  }
+  uint64_t key_hash = KeyHashProxy(key);
+//  if constexpr (std::is_pointer<T>::value) {
+//    // key_hash = h(key, (reinterpret_cast<string_key *>(key))->length);
+//    key_hash = h(key->key, key->length);
+//  } else {
+//    key_hash = h(&key, sizeof(key));
+//  }
   auto meta_hash = ((uint8_t)(key_hash & kMask));
   auto x = (key_hash >> (8 * sizeof(key_hash) - dir->global_depth));
 

@@ -7,7 +7,7 @@ cmake_minimum_required(VERSION 3.11)
 include(FetchContent)
 include(ExternalProject)
 
-set(CMAKE_CXX_STANDARD 17)
+set(CMAKE_CXX_STANDARD 11)
 set(CMAKE_CXX_FLAGS "${CMAKE_CXX_FLAGS} -Wno-long-long -fPIC -march=native")
 set(CMAKE_ENABLE_COMPILE_COMMANDS "ON")
 
@@ -19,7 +19,7 @@ endif ()
 ##################### PMDK ####################
 set(PMDK_PREFIX "${CMAKE_CURRENT_BINARY_DIR}/pmdk")
 ExternalProject_Add(PMDK
-        GIT_REPOSITORY https://github.com/HaoPatrick/pmdk.git
+        GIT_REPOSITORY https://github.com/xiewajueji/pmdk.git
         GIT_TAG addr-patch
 	BUILD_IN_SOURCE 1
         BUILD_COMMAND $(MAKE)
