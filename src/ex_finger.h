@@ -102,8 +102,423 @@ uint64_t KeyHashProxy (T key) {
   return KeyHash<T, std::is_pointer<T>::value>::Hash(key);
 }
 
+template <class T, bool is_flag = std::is_pointer<T>::value>
+struct Bucket;
+
 template <class T>
-struct Bucket {
+struct Bucket<T, true> {
+  inline int find_empty_slot() {
+    if (GET_COUNT(bitmap) == kNumPairPerBucket) {
+      return -1;
+    }
+    auto mask = ~(GET_BITMAP(bitmap));
+    return __builtin_ctz(mask);
+  }
+
+  /*true indicates overflow, needs extra check in the stash*/
+  inline bool test_overflow() { return overflowCount; }
+
+  inline bool test_stash_check() { return (overflowBitmap & overflowSet); }
+
+  inline void clear_stash_check() {
+    overflowBitmap = overflowBitmap & (~overflowSet);
+  }
+
+  inline void set_indicator(uint8_t meta_hash, Bucket<T> *neighbor,
+                            uint8_t pos) {
+    int mask = overflowBitmap & overflowBitmapMask;
+    mask = ~mask;
+    auto index = __builtin_ctz(mask);
+
+    if (index < 4) {
+      finger_array[14 + index] = meta_hash;
+      overflowBitmap = ((uint8_t)(1 << index) | overflowBitmap);
+      overflowIndex =
+          (overflowIndex & (~(3 << (index * 2)))) | (pos << (index * 2));
+    } else {
+      mask = neighbor->overflowBitmap & overflowBitmapMask;
+      mask = ~mask;
+      index = __builtin_ctz(mask);
+      if (index < 4) {
+        neighbor->finger_array[14 + index] = meta_hash;
+        neighbor->overflowBitmap =
+            ((uint8_t)(1 << index) | neighbor->overflowBitmap);
+        neighbor->overflowMember =
+            ((uint8_t)(1 << index) | neighbor->overflowMember);
+        neighbor->overflowIndex =
+            (neighbor->overflowIndex & (~(3 << (index * 2)))) |
+                (pos << (index * 2));
+      } else { /*overflow, increase count*/
+        overflowCount++;
+      }
+    }
+    overflowBitmap = overflowBitmap | overflowSet;
+  }
+
+  /*both clear this bucket and its neighbor bucket*/
+  inline void unset_indicator(uint8_t meta_hash, Bucket<T> *neighbor, T key,
+                              uint64_t pos) {
+    /*also needs to ensure that this meta_hash must belongs to other bucket*/
+    bool clear_success = false;
+    int mask1 = overflowBitmap & overflowBitmapMask;
+    for (int i = 0; i < 4; ++i) {
+      if (CHECK_BIT(mask1, i) && (finger_array[14 + i] == meta_hash) &&
+          (((1 << i) & overflowMember) == 0) &&
+          (((overflowIndex >> (2 * i)) & stashMask) == pos)) {
+        overflowBitmap = overflowBitmap & ((uint8_t)(~(1 << i)));
+        overflowIndex = overflowIndex & (~(3 << (i * 2)));
+        assert(((overflowIndex >> (i * 2)) & stashMask) == 0);
+        clear_success = true;
+        break;
+      }
+    }
+
+    int mask2 = neighbor->overflowBitmap & overflowBitmapMask;
+    if (!clear_success) {
+      for (int i = 0; i < 4; ++i) {
+        if (CHECK_BIT(mask2, i) &&
+            (neighbor->finger_array[14 + i] == meta_hash) &&
+            (((1 << i) & neighbor->overflowMember) != 0) &&
+            (((neighbor->overflowIndex >> (2 * i)) & stashMask) == pos)) {
+          neighbor->overflowBitmap =
+              neighbor->overflowBitmap & ((uint8_t)(~(1 << i)));
+          neighbor->overflowMember =
+              neighbor->overflowMember & ((uint8_t)(~(1 << i)));
+          neighbor->overflowIndex = neighbor->overflowIndex & (~(3 << (i * 2)));
+          assert(((neighbor->overflowIndex >> (i * 2)) & stashMask) == 0);
+          clear_success = true;
+          break;
+        }
+      }
+    }
+
+    if (!clear_success) {
+      overflowCount--;
+    }
+
+    mask1 = overflowBitmap & overflowBitmapMask;
+    mask2 = neighbor->overflowBitmap & overflowBitmapMask;
+    if (((mask1 & (~overflowMember)) == 0) && (overflowCount == 0) &&
+        ((mask2 & neighbor->overflowMember) == 0)) {
+      clear_stash_check();
+    }
+  }
+
+  int unique_check(uint8_t meta_hash, T key, Bucket<T> *neighbor,
+                   Bucket<T> *stash) {
+    if ((check_and_get(meta_hash, key, false) != NONE) ||
+        (neighbor->check_and_get(meta_hash, key, true) != NONE)) {
+      return -1;
+    }
+
+    if (test_stash_check()) {
+      auto test_stash = false;
+      if (test_overflow()) {
+        test_stash = true;
+      } else {
+        int mask = overflowBitmap & overflowBitmapMask;
+        if (mask != 0) {
+          for (int i = 0; i < 4; ++i) {
+            if (CHECK_BIT(mask, i) && (finger_array[14 + i] == meta_hash) &&
+                (((1 << i) & overflowMember) == 0)) {
+              test_stash = true;
+              goto STASH_CHECK;
+            }
+          }
+        }
+
+        mask = neighbor->overflowBitmap & overflowBitmapMask;
+        if (mask != 0) {
+          for (int i = 0; i < 4; ++i) {
+            if (CHECK_BIT(mask, i) &&
+                (neighbor->finger_array[14 + i] == meta_hash) &&
+                (((1 << i) & neighbor->overflowMember) != 0)) {
+              test_stash = true;
+              break;
+            }
+          }
+        }
+      }
+      STASH_CHECK:
+      if (test_stash == true) {
+        for (int i = 0; i < stashBucket; ++i) {
+          Bucket *curr_bucket = stash + i;
+          if (curr_bucket->check_and_get(meta_hash, key, false) != NONE) {
+            return -1;
+          }
+        }
+      }
+    }
+    return 0;
+  }
+
+  inline int get_current_mask() {
+    int mask = GET_BITMAP(bitmap) & GET_INVERSE_MEMBER(bitmap);
+    return mask;
+  }
+
+  Value_t check_and_get(uint8_t meta_hash, T key, bool probe) {
+    int mask = 0;
+    SSE_CMP8(finger_array, meta_hash);
+    if (!probe) {
+      mask = mask & GET_BITMAP(bitmap) & (~GET_MEMBER(bitmap));
+    } else {
+      mask = mask & GET_BITMAP(bitmap) & GET_MEMBER(bitmap);
+    }
+
+    if (mask == 0) {
+      return NONE;
+    }
+
+    /* variable-length key*/
+    string_key *_key = reinterpret_cast<string_key *>(key);
+    for (int i = 0; i < 14; i += 1) {
+      if (CHECK_BIT(mask, i) &&
+          (var_compare((reinterpret_cast<string_key *>(_[i].key))->key,
+                       _key->key,
+                       (reinterpret_cast<string_key *>(_[i].key))->length,
+                       _key->length))) {
+        return _[i].value;
+      }
+    }
+    return NONE;
+  }
+
+  inline void set_hash(int index, uint8_t meta_hash, bool probe) {
+    finger_array[index] = meta_hash;
+    uint32_t new_bitmap = bitmap | (1 << (index + 18));
+    if (probe) {
+      new_bitmap = new_bitmap | (1 << (index + 4));
+    }
+    new_bitmap += 1;
+    bitmap = new_bitmap;
+  }
+
+  inline uint8_t get_hash(int index) { return finger_array[index]; }
+
+  inline void unset_hash(int index, bool nt_flush = false) {
+    uint32_t new_bitmap =
+        bitmap & (~(1 << (index + 18))) & (~(1 << (index + 4)));
+    assert(GET_COUNT(bitmap) <= kNumPairPerBucket);
+    assert(GET_COUNT(bitmap) > 0);
+    new_bitmap -= 1;
+#ifdef PMEM
+    if (nt_flush) {
+      Allocator::NTWrite32(reinterpret_cast<uint32_t *>(&bitmap), new_bitmap);
+    } else {
+      bitmap = new_bitmap;
+    }
+#else
+    bitmap = new_bitmap;
+#endif
+  }
+
+  inline void get_lock() {
+    uint32_t new_value = 0;
+    uint32_t old_value = 0;
+    do {
+      while (true) {
+        old_value = __atomic_load_n(&version_lock, __ATOMIC_ACQUIRE);
+        if (!(old_value & lockSet)) {
+          old_value &= lockMask;
+          break;
+        }
+      }
+      new_value = old_value | lockSet;
+    } while (!CAS(&version_lock, &old_value, new_value));
+  }
+
+  inline bool try_get_lock() {
+    uint32_t v = __atomic_load_n(&version_lock, __ATOMIC_ACQUIRE);
+    if (v & lockSet) {
+      return false;
+    }
+    auto old_value = v & lockMask;
+    auto new_value = v | lockSet;
+    return CAS(&version_lock, &old_value, new_value);
+  }
+
+  inline void release_lock() {
+    uint32_t v = version_lock;
+    __atomic_store_n(&version_lock, v + 1 - lockSet, __ATOMIC_RELEASE);
+  }
+
+  /*if the lock is set, return true*/
+  inline bool test_lock_set(uint32_t &version) {
+    version = __atomic_load_n(&version_lock, __ATOMIC_ACQUIRE);
+    return (version & lockSet) != 0;
+  }
+
+  // test whether the version has change, if change, return true
+  inline bool test_lock_version_change(uint32_t old_version) {
+    auto value = __atomic_load_n(&version_lock, __ATOMIC_ACQUIRE);
+    return (old_version != value);
+  }
+
+  int Insert(T key, Value_t value, uint8_t meta_hash, bool probe) {
+    auto slot = find_empty_slot();
+    assert(slot < kNumPairPerBucket);
+    if (slot == -1) {
+      return -1;
+    }
+    _[slot].value = value;
+    _[slot].key = key;
+#ifdef PMEM
+    Allocator::Persist(&_[slot], sizeof(_[slot]));
+#endif
+    set_hash(slot, meta_hash, probe);
+    return 0;
+  }
+
+  /*if delete success, then return 0, else return -1*/
+  int Delete(T key, uint8_t meta_hash, bool probe) {
+    /*do the simd and check the key, then do the delete operation*/
+    int mask = 0;
+    SSE_CMP8(finger_array, meta_hash);
+    if (!probe) {
+      mask = mask & GET_BITMAP(bitmap) & (~GET_MEMBER(bitmap));
+    } else {
+      mask = mask & GET_BITMAP(bitmap) & GET_MEMBER(bitmap);
+    }
+
+    string_key *_key = reinterpret_cast<string_key *>(key);
+    /*loop unrolling*/
+    if (mask != 0) {
+      for (int i = 0; i < 12; i += 4) {
+        if (CHECK_BIT(mask, i) &&
+            (var_compare((reinterpret_cast<string_key *>(_[i].key))->key,
+                         _key->key,
+                         (reinterpret_cast<string_key *>(_[i].key))->length,
+                         _key->length))) {
+          unset_hash(i, false);
+          return 0;
+        }
+
+        if (CHECK_BIT(mask, i + 1) &&
+            (var_compare(
+                reinterpret_cast<string_key *>(_[i + 1].key)->key, _key->key,
+                (reinterpret_cast<string_key *>(_[i + 1].key))->length,
+                _key->length))) {
+          unset_hash(i + 1, false);
+          return 0;
+        }
+
+        if (CHECK_BIT(mask, i + 2) &&
+            (var_compare(
+                reinterpret_cast<string_key *>(_[i + 2].key)->key, _key->key,
+                (reinterpret_cast<string_key *>(_[i + 2].key))->length,
+                _key->length))) {
+          unset_hash(i + 2, false);
+          return 0;
+        }
+
+        if (CHECK_BIT(mask, i + 3) &&
+            (var_compare(
+                reinterpret_cast<string_key *>(_[i + 3].key)->key, _key->key,
+                (reinterpret_cast<string_key *>(_[i + 3].key))->length,
+                _key->length))) {
+          unset_hash(i + 3, false);
+          return 0;
+        }
+      }
+
+      if (CHECK_BIT(mask, 12) &&
+          (var_compare(reinterpret_cast<string_key *>(_[12].key)->key,
+                       _key->key,
+                       (reinterpret_cast<string_key *>(_[12].key))->length,
+                       _key->length))) {
+        unset_hash(12, false);
+        return 0;
+      }
+
+      if (CHECK_BIT(mask, 13) &&
+          (var_compare(reinterpret_cast<string_key *>(_[13].key)->key,
+                       _key->key,
+                       (reinterpret_cast<string_key *>(_[13].key))->length,
+                       _key->length))) {
+        unset_hash(13, false);
+        return 0;
+      }
+    }
+    return -1;
+  }
+
+  int Insert_with_noflush(T key, Value_t value, uint8_t meta_hash, bool probe) {
+    auto slot = find_empty_slot();
+    /* this branch can be removed*/
+    assert(slot < kNumPairPerBucket);
+    if (slot == -1) {
+      std::cout << "Cannot find the empty slot, for key " << key << std::endl;
+      return -1;
+    }
+    _[slot].value = value;
+    _[slot].key = key;
+    set_hash(slot, meta_hash, probe);
+    return 0;
+  }
+
+  void Insert_displace(T key, Value_t value, uint8_t meta_hash, int slot,
+                       bool probe) {
+    _[slot].value = value;
+    _[slot].key = key;
+#ifdef PMEM
+    Allocator::Persist(&_[slot], sizeof(_Pair<T>));
+#endif
+    set_hash(slot, meta_hash, probe);
+  }
+
+  void Insert_displace_with_noflush(T key, Value_t value, uint8_t meta_hash,
+                                    int slot, bool probe) {
+    _[slot].value = value;
+    _[slot].key = key;
+    set_hash(slot, meta_hash, probe);
+  }
+
+  /* Find the displacment element in this bucket*/
+  inline int Find_org_displacement() {
+    uint32_t mask = GET_INVERSE_MEMBER(bitmap);
+    if (mask == 0) {
+      return -1;
+    }
+    return __builtin_ctz(mask);
+  }
+
+  /*find element that it is in the probe*/
+  inline int Find_probe_displacement() {
+    uint32_t mask = GET_MEMBER(bitmap);
+    if (mask == 0) {
+      return -1;
+    }
+    return __builtin_ctz(mask);
+  }
+
+  inline void resetLock() { version_lock = 0; }
+
+  inline void resetOverflowFP() {
+    overflowBitmap = 0;
+    overflowIndex = 0;
+    overflowMember = 0;
+    overflowCount = 0;
+    clear_stash_check();
+  }
+
+  uint32_t version_lock;
+  uint32_t bitmap;          // allocation bitmap + pointer bitmap + counter
+  uint8_t finger_array[18]; /*only use the first 14 bytes, can be accelerated by
+                               SSE instruction,0-13 for finger, 14-17 for
+                               overflowed*/
+  uint8_t overflowBitmap;
+  uint8_t overflowIndex;
+  uint8_t overflowMember; /*overflowmember indicates membership of the overflow
+                             fingerprint*/
+  uint8_t overflowCount;
+  uint8_t unused[2];
+
+  _Pair<T> _[kNumPairPerBucket];
+};
+
+template <class T>
+struct Bucket<T, false> {
   inline int find_empty_slot() {
     if (GET_COUNT(bitmap) == kNumPairPerBucket) {
       return -1;
@@ -254,61 +669,6 @@ struct Bucket {
     return mask;
   }
 
-  template <bool is_pointer, typename = void>
-  struct CheckAndGetImpl;
-
-  template <typename U>
-  struct CheckAndGetImpl<true, U> {
-    static Value_t Process(int mask, T key, Bucket *bucket) {
-      /* variable-length key*/
-      string_key *_key = reinterpret_cast<string_key *>(key);
-      for (int i = 0; i < 14; i += 1) {
-        if (CHECK_BIT(mask, i) &&
-            (var_compare((reinterpret_cast<string_key *>(bucket->_[i].key))->key,
-                         _key->key,
-                         (reinterpret_cast<string_key *>(bucket->_[i].key))->length,
-                         _key->length))) {
-          return bucket->_[i].value;
-        }
-      }
-      return NONE;
-    }
-  };
-
-  template <typename U>
-  struct CheckAndGetImpl<false, U> {
-    static Value_t Process(int mask, T key, Bucket *bucket) {
-      /*fixed-length key*/
-      /*loop unrolling*/
-      for (int i = 0; i < 12; i += 4) {
-        if (CHECK_BIT(mask, i) && (bucket->_[i].key == key)) {
-          return bucket->_[i].value;
-        }
-
-        if (CHECK_BIT(mask, i + 1) && (bucket->_[i + 1].key == key)) {
-          return bucket->_[i + 1].value;
-        }
-
-        if (CHECK_BIT(mask, i + 2) && (bucket->_[i + 2].key == key)) {
-          return bucket->_[i + 2].value;
-        }
-
-        if (CHECK_BIT(mask, i + 3) && (bucket->_[i + 3].key == key)) {
-          return bucket->_[i + 3].value;
-        }
-      }
-
-      if (CHECK_BIT(mask, 12) && (bucket->_[12].key == key)) {
-        return bucket->_[12].value;
-      }
-
-      if (CHECK_BIT(mask, 13) && (bucket->_[13].key == key)) {
-        return bucket->_[13].value;
-      }
-      return NONE;
-    }
-  };
-
   Value_t check_and_get(uint8_t meta_hash, T key, bool probe) {
     int mask = 0;
     SSE_CMP8(finger_array, meta_hash);
@@ -322,7 +682,34 @@ struct Bucket {
       return NONE;
     }
 
-    return CheckAndGetImpl<std::is_pointer<T>::value>::Process(mask, key, this);
+    /*fixed-length key*/
+    /*loop unrolling*/
+    for (int i = 0; i < 12; i += 4) {
+      if (CHECK_BIT(mask, i) && (_[i].key == key)) {
+        return _[i].value;
+      }
+
+      if (CHECK_BIT(mask, i + 1) && (_[i + 1].key == key)) {
+        return _[i + 1].value;
+      }
+
+      if (CHECK_BIT(mask, i + 2) && (_[i + 2].key == key)) {
+        return _[i + 2].value;
+      }
+
+      if (CHECK_BIT(mask, i + 3) && (_[i + 3].key == key)) {
+        return _[i + 3].value;
+      }
+    }
+
+    if (CHECK_BIT(mask, 12) && (_[12].key == key)) {
+      return _[12].value;
+    }
+
+    if (CHECK_BIT(mask, 13) && (_[13].key == key)) {
+      return _[13].value;
+    }
+    return NONE;
   }
 
   inline void set_hash(int index, uint8_t meta_hash, bool probe) {
@@ -411,115 +798,6 @@ struct Bucket {
     return 0;
   }
 
-  template <bool is_pointer, typename = void>
-  struct DeleteImpl;
-
-  template <typename U>
-  struct DeleteImpl<true, U> {
-    static int Process(int mask, T key, Bucket *bucket) {
-      string_key *_key = reinterpret_cast<string_key *>(key);
-      /*loop unrolling*/
-      if (mask != 0) {
-        for (int i = 0; i < 12; i += 4) {
-          if (CHECK_BIT(mask, i) &&
-              (var_compare((reinterpret_cast<string_key *>(bucket->_[i].key))->key,
-                           _key->key,
-                           (reinterpret_cast<string_key *>(bucket->_[i].key))->length,
-                           _key->length))) {
-            bucket->unset_hash(i, false);
-            return 0;
-          }
-
-          if (CHECK_BIT(mask, i + 1) &&
-              (var_compare(
-                  reinterpret_cast<string_key *>(bucket->_[i + 1].key)->key, _key->key,
-                  (reinterpret_cast<string_key *>(bucket->_[i + 1].key))->length,
-                  _key->length))) {
-            bucket->unset_hash(i + 1, false);
-            return 0;
-          }
-
-          if (CHECK_BIT(mask, i + 2) &&
-              (var_compare(
-                  reinterpret_cast<string_key *>(bucket->_[i + 2].key)->key, _key->key,
-                  (reinterpret_cast<string_key *>(bucket->_[i + 2].key))->length,
-                  _key->length))) {
-            bucket->unset_hash(i + 2, false);
-            return 0;
-          }
-
-          if (CHECK_BIT(mask, i + 3) &&
-              (var_compare(
-                  reinterpret_cast<string_key *>(bucket->_[i + 3].key)->key, _key->key,
-                  (reinterpret_cast<string_key *>(bucket->_[i + 3].key))->length,
-                  _key->length))) {
-            bucket->unset_hash(i + 3, false);
-            return 0;
-          }
-        }
-
-        if (CHECK_BIT(mask, 12) &&
-            (var_compare(reinterpret_cast<string_key *>(bucket->_[12].key)->key,
-                         _key->key,
-                         (reinterpret_cast<string_key *>(bucket->_[12].key))->length,
-                         _key->length))) {
-          bucket->unset_hash(12, false);
-          return 0;
-        }
-
-        if (CHECK_BIT(mask, 13) &&
-            (var_compare(reinterpret_cast<string_key *>(bucket->_[13].key)->key,
-                         _key->key,
-                         (reinterpret_cast<string_key *>(bucket->_[13].key))->length,
-                         _key->length))) {
-          bucket->unset_hash(13, false);
-          return 0;
-        }
-      }
-      return -1;
-    }
-  };
-
-  template <typename U>
-  struct DeleteImpl<false, U> {
-    static int Process(int mask, T key, Bucket *bucket) {
-      if (mask != 0) {
-        for (int i = 0; i < 12; i += 4) {
-          if (CHECK_BIT(mask, i) && (bucket->_[i].key == key)) {
-            bucket->unset_hash(i, false);
-            return 0;
-          }
-
-          if (CHECK_BIT(mask, i + 1) && (bucket->_[i + 1].key == key)) {
-            bucket->unset_hash(i + 1, false);
-            return 0;
-          }
-
-          if (CHECK_BIT(mask, i + 2) && (bucket->_[i + 2].key == key)) {
-            bucket->unset_hash(i + 2, false);
-            return 0;
-          }
-
-          if (CHECK_BIT(mask, i + 3) && (bucket->_[i + 3].key == key)) {
-            bucket->unset_hash(i + 3, false);
-            return 0;
-          }
-        }
-
-        if (CHECK_BIT(mask, 12) && (bucket->_[12].key == key)) {
-          bucket->unset_hash(12, false);
-          return 0;
-        }
-
-        if (CHECK_BIT(mask, 13) && (bucket->_[13].key == key)) {
-          bucket->unset_hash(13, false);
-          return 0;
-        }
-      }
-      return -1;
-    }
-  };
-
   /*if delete success, then return 0, else return -1*/
   int Delete(T key, uint8_t meta_hash, bool probe) {
     /*do the simd and check the key, then do the delete operation*/
@@ -531,7 +809,40 @@ struct Bucket {
       mask = mask & GET_BITMAP(bitmap) & GET_MEMBER(bitmap);
     }
 
-    return DeleteImpl<std::is_pointer<T>::value>::Process(mask, key, this);
+    if (mask != 0) {
+      for (int i = 0; i < 12; i += 4) {
+        if (CHECK_BIT(mask, i) && (_[i].key == key)) {
+          unset_hash(i, false);
+          return 0;
+        }
+
+        if (CHECK_BIT(mask, i + 1) && (_[i + 1].key == key)) {
+          unset_hash(i + 1, false);
+          return 0;
+        }
+
+        if (CHECK_BIT(mask, i + 2) && (_[i + 2].key == key)) {
+          unset_hash(i + 2, false);
+          return 0;
+        }
+
+        if (CHECK_BIT(mask, i + 3) && (_[i + 3].key == key)) {
+          unset_hash(i + 3, false);
+          return 0;
+        }
+      }
+
+      if (CHECK_BIT(mask, 12) && (_[12].key == key)) {
+        unset_hash(12, false);
+        return 0;
+      }
+
+      if (CHECK_BIT(mask, 13) && (_[13].key == key)) {
+        unset_hash(13, false);
+        return 0;
+      }
+    }
+    return -1;
   }
 
   int Insert_with_noflush(T key, Value_t value, uint8_t meta_hash, bool probe) {
